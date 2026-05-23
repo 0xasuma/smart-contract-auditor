@@ -638,9 +638,13 @@ contract MyContract {
                 <button class="btn btn-primary" id="analyzeBtn" onclick="analyze()">
                     🔍 Analyze Contract
                 </button>
-                <button class="btn btn-secondary" onclick="loadExample()">
-                    📄 Load Example
-                </button>
+                <select id="exampleSelect" onchange="loadExample(this.value)" class="btn btn-secondary" style="cursor:pointer;">
+                    <option value="">📄 Load Example...</option>
+                    <option value="erc20">ERC20 Token (8 vulns)</option>
+                    <option value="vault">ETH Vault (6 vulns)</option>
+                    <option value="nft">NFT Auction (5 vulns)</option>
+                    <option value="safe">Safe Contract (Clean)</option>
+                </select>
                 <button class="btn btn-secondary" onclick="clearAll()">
                     🗑️ Clear
                 </button>
@@ -685,7 +689,8 @@ contract MyContract {
             charCount.textContent = `${chars.toLocaleString()} chars | ${lines} lines`;
         });
 
-        const EXAMPLE = `// SPDX-License-Identifier: MIT
+        const EXAMPLES = {
+        erc20: `// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
@@ -693,7 +698,6 @@ import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 contract VulnerableToken is ERC20 {
     address public owner;
     bool public paused = false;
-    
     mapping(address => bool) public blacklist;
     
     constructor() ERC20("VulnerableToken", "VUL") {
@@ -706,7 +710,8 @@ contract VulnerableToken is ERC20 {
     }
     
     // tx.origin vulnerability
-    function transferOwnership(address newOwner) public require(tx.origin == owner) {
+    function transferOwnership(address newOwner) public {
+        require(tx.origin == owner);
         owner = newOwner;
     }
     
@@ -718,7 +723,7 @@ contract VulnerableToken is ERC20 {
         _burn(msg.sender, amount);
     }
     
-    // Unchecked external call
+    // Unchecked external call + DoS
     function airdrop(address[] calldata recipients, uint256 amount) external {
         for (uint i = 0; i < recipients.length; i++) {
             recipients[i].call{value: amount}("");
@@ -730,15 +735,177 @@ contract VulnerableToken is ERC20 {
         return block.timestamp % 15 == 0;
     }
     
-    // Floating pragma, missing events
+    // Selfdestruct
+    function destroy() external {
+        selfdestruct(payable(owner));
+    }
+    
+    // Delegatecall
+    function execute(address target, bytes memory data) external {
+        target.delegatecall(data);
+    }
+    
+    // Missing events
     function emergencyStop() external {
         paused = true;
     }
-}`;
+}`,
+        
+        vault: `// SPDX-License-Identifier: MIT
+pragma solidity ^0.7.6;
 
-        function loadExample() {
-            textarea.value = EXAMPLE;
+contract ETHVault {
+    mapping(address => uint256) public balances;
+    address public admin;
+    address public pendingAdmin;
+    
+    constructor() {
+        admin = msg.sender;
+    }
+    
+    function deposit() external payable {
+        balances[msg.sender] += msg.value;
+    }
+    
+    // Reentrancy: state update after external call
+    function withdraw(uint256 amount) external {
+        require(balances[msg.sender] >= amount, "Insufficient balance");
+        (bool success, ) = msg.sender.call{value: amount}("");
+        require(success, "Transfer failed");
+        balances[msg.sender] -= amount;
+    }
+    
+    // Integer overflow (Solidity <0.8.0)
+    function addToBalance(uint256 extra) external {
+        balances[msg.sender] += extra;
+    }
+    
+    // tx.origin phishing
+    function setAdmin(address newAdmin) external {
+        require(tx.origin == admin, "Not admin");
+        admin = newAdmin;
+    }
+    
+    // Unchecked send return
+    function emergencyWithdraw() external {
+        uint256 bal = balances[msg.sender];
+        balances[msg.sender] = 0;
+        msg.sender.send(bal);
+    }
+    
+    // Missing access control on critical function
+    function sweepFunds(address to) external {
+        uint256 bal = address(this).balance;
+        (bool success, ) = to.call{value: bal}("");
+        require(success);
+    }
+}`,
+        
+        nft: `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+contract NFTAuction {
+    address public owner;
+    uint256 public highestBid;
+    address public highestBidder;
+    uint256 public auctionEndTime;
+    bool public ended;
+    
+    mapping(address => uint256) public pendingReturns;
+    
+    constructor(uint256 _duration) {
+        owner = msg.sender;
+        auctionEndTime = block.timestamp + _duration;
+    }
+    
+    function bid() external payable {
+        require(block.timestamp < auctionEndTime, "Auction ended");
+        require(msg.value > highestBid, "Bid too low");
+        
+        // No reentrancy guard, but pattern is risky
+        if (highestBidder != address(0)) {
+            pendingReturns[highestBidder] += highestBid;
+        }
+        highestBidder = msg.sender;
+        highestBid = msg.value;
+    }
+    
+    // Reentrancy: withdrawal pattern
+    function withdraw() external {
+        uint256 amount = pendingReturns[msg.sender];
+        require(amount > 0, "Nothing to withdraw");
+        pendingReturns[msg.sender] = 0;
+        (bool success, ) = msg.sender.call{value: amount}("");
+        require(success, "Transfer failed");
+    }
+    
+    // Timestamp dependency for auction end
+    function hasEnded() public view returns (bool) {
+        return block.timestamp >= auctionEndTime;
+    }
+    
+    // Only owner can end auction (but uses timestamp)
+    function endAuction() external {
+        require(hasEnded(), "Auction not ended");
+        require(!ended, "Already ended");
+        ended = true;
+        // Transfer NFT to highest bidder (simplified)
+    }
+    
+    // Front-running: no commit-reveal
+    function placeBidWithRefund() external payable {
+        require(msg.value > highestBid);
+        highestBid = msg.value;
+        highestBidder = msg.sender;
+    }
+    
+    // Missing events for bid, end, withdraw
+}`,
+        
+        safe: `// SPDX-License-Identifier: MIT
+pragma solidity 0.8.19;
+
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+contract SafeVault is ReentrancyGuard, Ownable {
+    mapping(address => uint256) public balances;
+    
+    event Deposit(address indexed user, uint256 amount);
+    event Withdraw(address indexed user, uint256 amount);
+    event AdminUpdated(address indexed oldAdmin, address indexed newAdmin);
+    
+    function deposit() external payable {
+        require(msg.value > 0, "Must send ETH");
+        balances[msg.sender] += msg.value;
+        emit Deposit(msg.sender, msg.value);
+    }
+    
+    function withdraw(uint256 amount) external nonReentrant {
+        require(balances[msg.sender] >= amount, "Insufficient balance");
+        balances[msg.sender] -= amount;
+        (bool success, ) = msg.sender.call{value: amount}("");
+        require(success, "Transfer failed");
+        emit Withdraw(msg.sender, amount);
+    }
+    
+    function getBalance() external view returns (uint256) {
+        return address(this).balance;
+    }
+    
+    function transferAdmin(address newAdmin) external onlyOwner {
+        require(newAdmin != address(0), "Zero address");
+        emit AdminUpdated(owner(), newAdmin);
+        transferOwnership(newAdmin);
+    }
+}`
+        };
+
+        function loadExample(key) {
+            if (!key) return;
+            textarea.value = EXAMPLES[key];
             textarea.dispatchEvent(new Event('input'));
+            document.getElementById('exampleSelect').value = '';
         }
 
         function clearAll() {
